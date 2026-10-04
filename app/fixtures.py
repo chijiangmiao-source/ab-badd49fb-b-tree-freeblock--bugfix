@@ -280,6 +280,65 @@ def invalid_scenarios():
         2 * PAGE_SIZE + PAGE_SIZE - 1,
     )
 
+    # Overlapping cells: rowids stay strictly increasing, but cell 1's pointer
+    # lands inside cell 0's payload bytes (which happen to parse as a short
+    # cell: payload length 1, rowid 2).
+    b, meta = _base_builder()
+    page3 = b.page(3)
+    embedded_cell = encode_varint(1) + encode_varint(2) + b"\xaa"  # 1-byte payload, rowid 2
+    info3 = b.add_table_leaf(3, [(1, embedded_cell + b"\x00\x00")])
+    overlap_ptr = info3[1]["ptr"] + 2  # first payload byte of cell 0
+    page3[3:5] = (2).to_bytes(2, "big")
+    page3[10:12] = overlap_ptr.to_bytes(2, "big")
+    scenarios["leaf_cell_overlap"] = (
+        b.build(),
+        ROOT_PAGE,
+        "CELL_OVERLAP",
+        3,
+        2 * PAGE_SIZE + 10,
+    )
+
+    # Cell pointer targeting a declared freeblock: the freeblock bytes also
+    # parse as a short cell (payload length 3, rowid 2), but free space cannot
+    # be owned by a live cell.  The freeblock's big-endian next-pointer bytes
+    # double as the cell's payload-length/rowid varints (0x0302 -> the second
+    # freeblock at byte 770), so the freeblock chain itself stays valid.
+    b = SnapshotBuilder(page_size=PAGE_SIZE, page_count=2)
+    page2 = b.page(2)
+    page2[0] = 0x0D
+    second_fb = 0x0302  # 770: reads back as payload-len 3, rowid 2 varints
+    page2[second_fb : second_fb + 4] = (0).to_bytes(2, "big") + (4).to_bytes(
+        2, "big"
+    )  # next freeblock 0, size 4
+    first_fb = 900
+    page2[first_fb : first_fb + 2] = (second_fb).to_bytes(2, "big")  # 03 02
+    page2[first_fb + 2 : first_fb + 4] = (5).to_bytes(2, "big")  # size 5
+    page2[first_fb + 4] = 0xCD  # third payload byte of the decoy cell
+    page2[1:3] = (first_fb).to_bytes(2, "big")  # page header: first freeblock
+    # Real rowid-3 cell at the top of the page, then 30 filler cells rowids
+    # 4..33 pulling the content area start down to 670 (<= second freeblock).
+    ptrs = [first_fb, 1021]
+    page2[1021:1024] = encode_varint(1) + encode_varint(3) + b"z"
+    top = 760
+    for rowid in range(4, 34):
+        top -= 3
+        page2[top : top + 3] = encode_varint(1) + encode_varint(rowid) + bytes(
+            [rowid & 0xFF]
+        )
+        ptrs.append(top)
+    content_start = top  # 670
+    page2[3:5] = len(ptrs).to_bytes(2, "big")
+    page2[5:7] = content_start.to_bytes(2, "big")
+    for i, ptr in enumerate(ptrs):
+        page2[8 + 2 * i : 10 + 2 * i] = ptr.to_bytes(2, "big")
+    scenarios["cell_pointer_into_freeblock"] = (
+        b.build(),
+        2,
+        "CELL_POINTER_IN_FREEBLOCK",
+        2,
+        1 * PAGE_SIZE + 8,
+    )
+
     # Root page out of range.
     b, meta = _base_builder()
     scenarios["root_out_of_range"] = (

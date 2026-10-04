@@ -22,6 +22,8 @@
 **结构校验**：
 
 - 单元边界与指针数组（越界指针、指针数组溢出、内容区非法均拒绝）
+- 页内单元字节区间两两不重叠，且不得引用或覆盖页头声明的 freeblock
+  （物理排列可不按指针顺序，只要各自占用独立、有效的字节区域即可）
 - 子树行键严格递增（叶内递增；内部分隔键 ≥ 左子树最大键且 < 右子树最小键）
 - 溢出链恰好覆盖声明负载（页数精确、末页 next=0，截断/超长均拒绝）
 - 页面唯一归属：活页重复归属、B-tree 成环（祖先回指）、活页进入空闲链均拒绝
@@ -106,6 +108,9 @@ docker compose down
 | `NOT_A_TABLE_BTREE_PAGE` | 根/子页非表 B-tree 页 |
 | `CELL_POINTER_ARRAY_OVERFLOW` / `CONTENT_AREA_INVALID` / `CELL_POINTER_OUT_OF_BOUNDS` | 指针数组与单元边界 |
 | `TRUNCATED_CELL` | 截断单元（varint/负载越页） |
+| `CELL_OVERLAP` | 单元占用的字节区间互相重叠 |
+| `CELL_POINTER_IN_FREEBLOCK` / `CELL_OVERLAPS_FREEBLOCK` | 单元指针或单元负载落入页头声明的 freeblock |
+| `FREEBLOCK_OUT_OF_BOUNDS` / `FREEBLOCK_INVALID_SIZE` / `FREEBLOCK_CHAIN_CYCLE` | 页内 freeblock 链越界、尺寸非法或成环 |
 | `ROWID_NOT_INCREASING` | 叶内行键未严格递增 |
 | `KEY_BOUND_CONFLICT` | 分隔键与子树键范围冲突 |
 | `CHILD_PAGE_OUT_OF_RANGE` | 子页号越界 |

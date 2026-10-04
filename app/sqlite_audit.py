@@ -400,13 +400,91 @@ class Auditor:
             cells.append(base + cptr)
 
         if ptype == PAGE_TYPE_LEAF_TABLE:
-            return self._parse_leaf(pgno, owner, cells, page_end)
+            freeblocks = self._read_freeblocks(pgno, hdr, base, content_start)
+            return self._parse_leaf(
+                pgno, owner, cells, page_end, base, hdr, freeblocks
+            )
         return self._parse_interior(pgno, owner, cells, hdr, page_end, depth)
 
-    def _parse_leaf(self, pgno, owner, cells, page_end):
+    def _read_freeblocks(self, pgno, hdr, base, content_start):
+        """Walk the freeblock chain declared in a page header.
+
+        Freeblocks live in the cell content area and must never be referenced
+        by a cell pointer.  Returns [(rel_start, rel_end, next_pointer_offset)];
+        rejects out-of-range/cyclic chains.
+        """
+        freeblocks = []
+        seen = set()
+        nxt = self.u16(hdr + 1)
+        ref_off = base + 1  # file offset of the pointer that yielded `nxt`
+        chain_step = 0
+        while nxt != 0:
+            if nxt < content_start or nxt + 4 > self.page_size:
+                self.fail(
+                    "FREEBLOCK_OUT_OF_BOUNDS",
+                    f"page {pgno} freeblock chain references byte {nxt}, outside "
+                    f"the cell content area {content_start}..{self.page_size - 1}",
+                    page=pgno,
+                    offset=ref_off,
+                    detail={
+                        "freeblock": nxt,
+                        "content_start": content_start,
+                        "chain_step": chain_step,
+                    },
+                )
+            if nxt in seen:
+                self.fail(
+                    "FREEBLOCK_CHAIN_CYCLE",
+                    f"page {pgno} freeblock chain cycles back to byte {nxt}",
+                    page=pgno,
+                    offset=ref_off,
+                    detail={"freeblock": nxt, "chain_step": chain_step},
+                )
+            seen.add(nxt)
+            fb_off = base + nxt
+            size = self.u16(fb_off + 2)
+            if size < 4 or nxt + size > self.page_size:
+                self.fail(
+                    "FREEBLOCK_INVALID_SIZE",
+                    f"page {pgno} freeblock at byte {nxt} declares size {size}; a "
+                    f"freeblock needs at least 4 bytes and must stay on the page",
+                    page=pgno,
+                    offset=fb_off + 2,
+                    detail={"freeblock": nxt, "size": size},
+                )
+            freeblocks.append((nxt, nxt + size, fb_off))
+            nxt = self.u16(fb_off)
+            ref_off = fb_off
+            chain_step += 1
+        return freeblocks
+
+    def _parse_leaf(self, pgno, owner, cells, page_end, base, hdr, freeblocks):
+        # Occupied cell byte spans, kept in pointer-array order; order on the
+        # page does not have to match (SQLite cells may be shuffled), so the
+        # ranges are tracked explicitly instead of trusting adjacency.
+        occupied: list[tuple[int, int, int]] = []  # (cell_index, start, end)
         prev = None
         lo = hi = None
         for i, coff in enumerate(cells):
+            ptr_off = hdr + 8 + 2 * i
+            ptr_rel = coff - base
+            for fb_start, fb_end, fb_off in freeblocks:
+                if fb_start <= ptr_rel < fb_end:
+                    self.fail(
+                        "CELL_POINTER_IN_FREEBLOCK",
+                        f"page {pgno} cell {i} pointer ({ptr_rel}) targets a "
+                        f"declared freeblock spanning bytes {fb_start}..{fb_end - 1}; "
+                        f"a live cell cannot own free space",
+                        page=pgno,
+                        offset=ptr_off,
+                        detail={
+                            "cell_index": i,
+                            "pointer": ptr_rel,
+                            "freeblock": fb_start,
+                            "freeblock_size": fb_end - fb_start,
+                            "freeblock_next_offset": fb_off,
+                        },
+                    )
             payload_len, o = self.read_varint(
                 coff, page_end, pgno, f"cell {i} payload length"
             )
@@ -427,6 +505,50 @@ class Auditor:
                         "local_bytes": local,
                     },
                 )
+            # A cell must own a byte region disjoint from every other cell and
+            # from every declared freeblock, regardless of physical order on
+            # the page (cells need not be laid out in pointer order).
+            span_start, span_end = coff, cell_end
+            for other_i, other_start, other_end in occupied:
+                if span_start < other_end and other_start < span_end:
+                    self.fail(
+                        "CELL_OVERLAP",
+                        f"page {pgno} cell {i} bytes "
+                        f"{span_start - base}..{span_end - base - 1} overlap cell "
+                        f"{other_i} bytes {other_start - base}..{other_end - base - 1}",
+                        page=pgno,
+                        offset=ptr_off,
+                        detail={
+                            "cell_index": i,
+                            "other_cell_index": other_i,
+                            "cell_start": span_start - base,
+                            "cell_end": span_end - base - 1,
+                            "other_start": other_start - base,
+                            "other_end": other_end - base - 1,
+                            "overlap_start": max(span_start, other_start) - base,
+                            "overlap_end": min(span_end, other_end) - base - 1,
+                        },
+                    )
+            for fb_start, fb_end, fb_off in freeblocks:
+                fb_abs_start, fb_abs_end = base + fb_start, base + fb_end
+                if span_start < fb_abs_end and fb_abs_start < span_end:
+                    self.fail(
+                        "CELL_OVERLAPS_FREEBLOCK",
+                        f"page {pgno} cell {i} bytes "
+                        f"{span_start - base}..{span_end - base - 1} overlap a "
+                        f"declared freeblock spanning bytes {fb_start}..{fb_end - 1}",
+                        page=pgno,
+                        offset=ptr_off,
+                        detail={
+                            "cell_index": i,
+                            "cell_start": span_start - base,
+                            "cell_end": span_end - base - 1,
+                            "freeblock": fb_start,
+                            "freeblock_size": fb_end - fb_start,
+                            "freeblock_next_offset": fb_off,
+                        },
+                    )
+            occupied.append((i, span_start, span_end))
             if spills:
                 head = self.u32(o + local)
                 self.pending_overflow.append(

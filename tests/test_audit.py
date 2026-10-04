@@ -3,7 +3,13 @@
 import unittest
 
 from app import fixtures
-from app.fixtures import PAGE_SIZE, SnapshotBuilder, _base_builder, valid_snapshot
+from app.fixtures import (
+    PAGE_SIZE,
+    SnapshotBuilder,
+    _base_builder,
+    encode_varint,
+    valid_snapshot,
+)
 from app.sqlite_audit import audit_snapshot
 
 
@@ -85,6 +91,8 @@ class InvalidScenarioTests(unittest.TestCase):
             "key_bound_conflict",
             "live_page_on_freelist",
             "truncated_cell",
+            "leaf_cell_overlap",
+            "cell_pointer_into_freeblock",
             "root_out_of_range",
             "overflow_chain_overrun",
             "overflow_chain_truncated",
@@ -206,6 +214,93 @@ class BtreeStructureTests(unittest.TestCase):
         self.assertEqual(res["error"]["code"], "ROWID_NOT_INCREASING")
         self.assertEqual(res["error"]["page"], 3)
         self.assertEqual(res["error"]["offset"], 2 * PAGE_SIZE + info[2]["ptr"])
+
+    def test_overlapping_cells_rejected_with_stable_pointer_location(self):
+        # Rowids are strictly increasing; only the cell byte ranges overlap.
+        data, root, *_ = fixtures.invalid_scenarios()["leaf_cell_overlap"]
+        res = audit_snapshot(data, root)
+        self.assertEqual(res["verdict"], "rejected")
+        err = res["error"]
+        self.assertEqual(err["code"], "CELL_OVERLAP")
+        self.assertEqual(err["page"], 3)
+        # Evidence is the conflicting cell pointer (cell 1), not the cell body.
+        self.assertEqual(err["offset"], 2 * PAGE_SIZE + 10)
+        self.assertEqual(err["detail"]["cell_index"], 1)
+        self.assertEqual(err["detail"]["other_cell_index"], 0)
+        self.assertEqual(err["detail"]["cell_start"], err["detail"]["other_start"] + 2)
+        # Stable: repeated audits report the same first evidence.
+        self.assertEqual(res, audit_snapshot(data, root))
+
+    def test_overlapping_cells_conflict_independent_of_pointer_order(self):
+        # Even when the later (higher-address, smaller-range) cell is listed
+        # first, the overlap must be rejected at the conflicting pointer.
+        b = SnapshotBuilder(page_size=PAGE_SIZE, page_count=2)
+        page = b.page(2)
+        page[0] = 0x0D
+        page[3:5] = (2).to_bytes(2, "big")
+        page[5:7] = (900).to_bytes(2, "big")
+        # Big cell (rowid 1) at 900..908; small cell (rowid 2) nested at 902.
+        page[900:909] = (
+            encode_varint(7) + encode_varint(1)
+            + encode_varint(1) + encode_varint(2) + b"\xaa\x00\x00\x00\x00"
+        )
+        page[8:10] = (900).to_bytes(2, "big")   # cell 0 -> rowid 1, spans 900..910
+        page[10:12] = (902).to_bytes(2, "big")  # cell 1 -> rowid 2, nested
+        res = audit_snapshot(b.build(), 2)
+        self.assertEqual(res["error"]["code"], "CELL_OVERLAP")
+        self.assertEqual(res["error"]["offset"], PAGE_SIZE + 10)
+
+    def test_cell_pointer_into_declared_freeblock_rejected(self):
+        # The freeblock bytes happen to parse as a short cell; they are still
+        # declared free space and must not be accepted as a live cell.
+        data, root, *_ = fixtures.invalid_scenarios()[
+            "cell_pointer_into_freeblock"
+        ]
+        res = audit_snapshot(data, root)
+        self.assertEqual(res["verdict"], "rejected")
+        err = res["error"]
+        self.assertEqual(err["code"], "CELL_POINTER_IN_FREEBLOCK")
+        self.assertEqual(err["page"], 2)
+        # Evidence is the cell pointer slot that references the freeblock.
+        self.assertEqual(err["offset"], PAGE_SIZE + 8)
+        self.assertEqual(err["detail"]["cell_index"], 0)
+        self.assertEqual(err["detail"]["pointer"], err["detail"]["freeblock"])
+        self.assertEqual(res, audit_snapshot(data, root))
+
+    def test_declared_freeblocks_accepted_when_no_cell_uses_them(self):
+        # Same freeblock layout as the corrupted scenario, but no cell pointer
+        # targets either freeblock: declared free space is legal.
+        data, root, *_ = fixtures.invalid_scenarios()[
+            "cell_pointer_into_freeblock"
+        ]
+        repaired = bytearray(data)
+        page_off = PAGE_SIZE
+        # Slot 0 referenced the freeblock: repoint it at a disjoint short cell
+        # placed just below the freeblock (900), and bump the real rowid-3 cell
+        # in slot 1 so pointer order matches increasing rowids 2 then 3.
+        repaired[page_off + 897 : page_off + 900] = (
+            encode_varint(1) + encode_varint(2) + b"y"
+        )
+        repaired[page_off + 8 : page_off + 10] = (897).to_bytes(2, "big")
+        repaired[page_off + 10 : page_off + 12] = (1021).to_bytes(2, "big")
+        res = audit_snapshot(bytes(repaired), root)
+        self.assertEqual(res["verdict"], "accepted", res["error"])
+
+    def test_physically_reordered_but_disjoint_cells_accepted(self):
+        # Cells need not be laid out in pointer order on the page.
+        b = SnapshotBuilder(page_size=PAGE_SIZE, page_count=2)
+        page = b.page(2)
+        page[0] = 0x0D
+        page[3:5] = (2).to_bytes(2, "big")
+        page[5:7] = (900).to_bytes(2, "big")
+        cell1 = encode_varint(1) + encode_varint(1) + b"a"  # rowid 1 at 920
+        cell2 = encode_varint(1) + encode_varint(2) + b"b"  # rowid 2 at 900
+        page[920 : 920 + len(cell1)] = cell1
+        page[900 : 900 + len(cell2)] = cell2
+        page[8:10] = (920).to_bytes(2, "big")
+        page[10:12] = (900).to_bytes(2, "big")
+        res = audit_snapshot(b.build(), 2)
+        self.assertEqual(res["verdict"], "accepted", res["error"])
 
     def test_divider_key_reaches_right_subtree(self):
         b, _ = _base_builder()
