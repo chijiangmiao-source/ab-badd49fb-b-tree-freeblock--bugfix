@@ -135,6 +135,23 @@ class SnapshotBuilder:
         for i, leaf in enumerate(leaves):
             page[8 + 4 * i : 12 + 4 * i] = leaf.to_bytes(4, "big")
 
+    def set_cell_pointers(self, pgno, ptrs, first_page=False, interior=False):
+        """Overwrite the cell pointer array (cell count stays as declared)."""
+        hdr = 100 if first_page else 0
+        hdr_size = 12 if interior else 8
+        page = self.page(pgno)
+        for i, ptr in enumerate(ptrs):
+            off = hdr + hdr_size + 2 * i
+            page[off : off + 2] = ptr.to_bytes(2, "big")
+
+    def declare_freeblock(self, pgno, offset, size, next_freeblock=0, first_page=False):
+        """Link one freeblock into the page header's freeblock chain head."""
+        hdr = 100 if first_page else 0
+        page = self.page(pgno)
+        page[hdr + 1 : hdr + 3] = offset.to_bytes(2, "big")
+        page[offset : offset + 2] = next_freeblock.to_bytes(2, "big")
+        page[offset + 2 : offset + 4] = size.to_bytes(2, "big")
+
     def build(self) -> bytes:
         data = bytearray(self.page_size * self.page_count)
         for pgno, page in self.pages.items():
@@ -278,6 +295,50 @@ def invalid_scenarios():
         "TRUNCATED_CELL",
         3,
         2 * PAGE_SIZE + PAGE_SIZE - 1,
+    )
+
+    # Overlapping cells: rowids stay ordered, but leaf 3 cell 1's pointer
+    # lands inside cell 0's payload bytes (a short cell hides there).
+    b, meta = _base_builder()
+    hidden = b"\x02\x02AA" + b"x" * 16  # cell 1 = len 2, rowid 2, "AA"
+    info3 = b.add_table_leaf(
+        3, [(1, hidden), (2, b"tm-0002"), (3, b"tm-0003"), (4, b"tm-0004")]
+    )
+    b.set_cell_pointers(
+        3,
+        [
+            info3[1]["ptr"],
+            info3[1]["ptr"] + 2,  # inside cell 0's payload
+            info3[3]["ptr"],
+            info3[4]["ptr"],
+        ],
+    )
+    scenarios["cell_overlap"] = (
+        b.build(),
+        ROOT_PAGE,
+        "CELL_OVERLAP",
+        3,
+        2 * PAGE_SIZE + 8 + 2 * 1,
+    )
+
+    # Cell into freeblock: the page header declares a freeblock and leaf 3
+    # cell 0 points at it; the freeblock's leading bytes (next=0, size=8)
+    # still parse as a short cell (payload length 0, rowid 0).
+    b, meta = _base_builder()
+    fb_off = 512
+    b.declare_freeblock(3, fb_off, 8)
+    page3 = b.page(3)
+    page3[3:5] = (5).to_bytes(2, "big")  # one extra cell
+    page3[5:7] = fb_off.to_bytes(2, "big")  # content area starts at the freeblock
+    b.set_cell_pointers(
+        3, [fb_off] + [meta["leaf3"][r]["ptr"] for r in (1, 2, 3, 4)]
+    )
+    scenarios["cell_into_freeblock"] = (
+        b.build(),
+        ROOT_PAGE,
+        "CELL_IN_FREEBLOCK",
+        3,
+        2 * PAGE_SIZE + 8,
     )
 
     # Root page out of range.

@@ -310,6 +310,86 @@ class Auditor:
 
     # -- table b-tree -----------------------------------------------------------
 
+    def _freeblock_ranges(self, pgno, hdr, base):
+        """Parse the page's freeblock chain; returns absolute (start, end) ranges.
+
+        Freeblocks are linked in order of increasing offset and each holds a
+        2-byte next pointer and a 2-byte size (including those 4 bytes).  A
+        chain that breaks these rules is corruption; the strict ordering also
+        guarantees the walk terminates.
+        """
+        ranges = []
+        ref_off = hdr + 1  # header field naming the first freeblock
+        fb = self.u16(hdr + 1)
+        prev_end = 0
+        while fb != 0:
+            if fb < prev_end or fb + 4 > self.page_size:
+                self.fail(
+                    "FREEBLOCK_INVALID",
+                    f"page {pgno} freeblock chain names a block at byte {fb} "
+                    f"that does not fit after the previous block (end "
+                    f"{prev_end}) on the page",
+                    page=pgno,
+                    offset=ref_off,
+                    detail={"freeblock": fb, "previous_block_end": prev_end},
+                )
+            size = self.u16(base + fb + 2)
+            if size < 4 or fb + size > self.page_size:
+                self.fail(
+                    "FREEBLOCK_INVALID",
+                    f"page {pgno} freeblock at byte {fb} declares size {size}; "
+                    f"a freeblock needs 4..{self.page_size - fb} bytes there",
+                    page=pgno,
+                    offset=base + fb + 2,
+                    detail={"freeblock": fb, "size": size},
+                )
+            ranges.append((base + fb, base + fb + size))
+            prev_end = fb + size
+            ref_off = base + fb  # this block's next pointer names the next one
+            fb = self.u16(base + fb)
+        return ranges
+
+    def _check_cell_placement(self, pgno, index, start, end, ptr_off, placed, freeblocks):
+        """Reject a cell whose byte range hits a declared freeblock or an
+        earlier cell on the same page.  Ranges are absolute file offsets."""
+        base = self.page_base(pgno)
+        for fb_start, fb_end in freeblocks:
+            if start < fb_end and fb_start < end:
+                self.fail(
+                    "CELL_IN_FREEBLOCK",
+                    f"page {pgno} cell {index} occupies bytes {start - base}.."
+                    f"{end - base - 1}, overlapping the declared freeblock "
+                    f"{fb_start - base}..{fb_end - base - 1}",
+                    page=pgno,
+                    offset=ptr_off,
+                    detail={
+                        "cell_index": index,
+                        "cell_start": start - base,
+                        "cell_end": end - base,
+                        "freeblock_start": fb_start - base,
+                        "freeblock_end": fb_end - base,
+                    },
+                )
+        for p_start, p_end, p_index in placed:
+            if start < p_end and p_start < end:
+                self.fail(
+                    "CELL_OVERLAP",
+                    f"page {pgno} cell {index} occupies bytes {start - base}.."
+                    f"{end - base - 1}, overlapping cell {p_index} at bytes "
+                    f"{p_start - base}..{p_end - base - 1}",
+                    page=pgno,
+                    offset=ptr_off,
+                    detail={
+                        "cell_index": index,
+                        "cell_start": start - base,
+                        "cell_end": end - base,
+                        "other_cell_index": p_index,
+                        "other_cell_start": p_start - base,
+                        "other_cell_end": p_end - base,
+                    },
+                )
+        placed.append((start, end, index))
+
     def _require_child_in_range(self, child, holder, offset):
         if not 1 <= child <= self.page_count:
             self.fail(
@@ -380,6 +460,7 @@ class Auditor:
                     "pointer_array_end": ptr_end_rel,
                 },
             )
+        freeblocks = self._freeblock_ranges(pgno, hdr, base)
         cells = []
         for i in range(ncells):
             ptr_off = hdr + hdr_size + 2 * i
@@ -397,16 +478,33 @@ class Auditor:
                         "content_start": content_start,
                     },
                 )
-            cells.append(base + cptr)
+            coff = base + cptr
+            for fb_start, fb_end in freeblocks:
+                if fb_start <= coff < fb_end:
+                    self.fail(
+                        "CELL_IN_FREEBLOCK",
+                        f"page {pgno} cell {i} points to byte {cptr}, inside the "
+                        f"declared freeblock {fb_start - base}..{fb_end - base - 1}",
+                        page=pgno,
+                        offset=ptr_off,
+                        detail={
+                            "cell_index": i,
+                            "pointer": cptr,
+                            "freeblock_start": fb_start - base,
+                            "freeblock_end": fb_end - base,
+                        },
+                    )
+            cells.append((coff, ptr_off))
 
         if ptype == PAGE_TYPE_LEAF_TABLE:
-            return self._parse_leaf(pgno, owner, cells, page_end)
-        return self._parse_interior(pgno, owner, cells, hdr, page_end, depth)
+            return self._parse_leaf(pgno, owner, cells, freeblocks, page_end)
+        return self._parse_interior(pgno, owner, cells, freeblocks, hdr, page_end, depth)
 
-    def _parse_leaf(self, pgno, owner, cells, page_end):
+    def _parse_leaf(self, pgno, owner, cells, freeblocks, page_end):
         prev = None
         lo = hi = None
-        for i, coff in enumerate(cells):
+        placed = []
+        for i, (coff, ptr_off) in enumerate(cells):
             payload_len, o = self.read_varint(
                 coff, page_end, pgno, f"cell {i} payload length"
             )
@@ -427,6 +525,9 @@ class Auditor:
                         "local_bytes": local,
                     },
                 )
+            self._check_cell_placement(
+                pgno, i, coff, cell_end, ptr_off, placed, freeblocks
+            )
             if spills:
                 head = self.u32(o + local)
                 self.pending_overflow.append(
@@ -453,10 +554,11 @@ class Auditor:
         owner.rowid_max = hi
         return (lo, hi, len(cells))
 
-    def _parse_interior(self, pgno, owner, cells, hdr, page_end, depth):
+    def _parse_interior(self, pgno, owner, cells, freeblocks, hdr, page_end, depth):
         right_ptr = self.u32(hdr + 8)
         entries = []
-        for i, coff in enumerate(cells):
+        placed = []
+        for i, (coff, ptr_off) in enumerate(cells):
             if coff + 4 > page_end:
                 self.fail(
                     "TRUNCATED_CELL",
@@ -466,8 +568,11 @@ class Auditor:
                     detail={"cell_index": i},
                 )
             child = self.u32(coff)
-            key_raw, _ = self.read_varint(
+            key_raw, key_end = self.read_varint(
                 coff + 4, page_end, pgno, f"cell {i} divider key"
+            )
+            self._check_cell_placement(
+                pgno, i, coff, key_end, ptr_off, placed, freeblocks
             )
             entries.append((child, to_signed64(key_raw), coff, coff + 4))
         children = [e[0] for e in entries] + [right_ptr]

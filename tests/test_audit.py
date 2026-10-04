@@ -85,6 +85,8 @@ class InvalidScenarioTests(unittest.TestCase):
             "key_bound_conflict",
             "live_page_on_freelist",
             "truncated_cell",
+            "cell_overlap",
+            "cell_into_freeblock",
             "root_out_of_range",
             "overflow_chain_overrun",
             "overflow_chain_truncated",
@@ -231,6 +233,112 @@ class BtreeStructureTests(unittest.TestCase):
         self.assertEqual(res["error"]["code"], "KEY_BOUND_CONFLICT")
         self.assertEqual(res["error"]["page"], 11)
         self.assertEqual(res["error"]["detail"]["left_subtree_max"], 4)
+
+
+class CellPlacementTests(unittest.TestCase):
+    """Cells must occupy disjoint byte ranges and stay out of freeblocks."""
+
+    def test_overlapping_cells_rejected(self):
+        data, root, code, page, offset = fixtures.invalid_scenarios()["cell_overlap"]
+        res = audit_snapshot(data, root)
+        self.assertEqual(res["verdict"], "rejected")
+        err = res["error"]
+        self.assertEqual(err["code"], code)
+        self.assertEqual(err["page"], page)
+        self.assertEqual(err["offset"], offset)
+        self.assertEqual(err["detail"]["cell_index"], 1)
+        self.assertEqual(err["detail"]["other_cell_index"], 0)
+        # Deterministic: same input, same first evidence.
+        self.assertEqual(res, audit_snapshot(data, root))
+
+    def test_cell_pointer_into_freeblock_rejected(self):
+        data, root, code, page, offset = fixtures.invalid_scenarios()[
+            "cell_into_freeblock"
+        ]
+        res = audit_snapshot(data, root)
+        self.assertEqual(res["verdict"], "rejected")
+        err = res["error"]
+        self.assertEqual(err["code"], code)
+        self.assertEqual(err["page"], page)
+        self.assertEqual(err["offset"], offset)
+        self.assertEqual(err["detail"]["cell_index"], 0)
+        self.assertEqual(err["detail"]["pointer"], 512)
+        self.assertEqual(err["detail"]["freeblock_start"], 512)
+        self.assertEqual(err["detail"]["freeblock_end"], 520)
+        self.assertEqual(res, audit_snapshot(data, root))
+
+    def test_cell_range_reaching_into_freeblock_rejected(self):
+        # The pointer itself sits before the freeblock, but the cell body
+        # reaches into it.
+        b, meta = _base_builder()
+        page3 = b.page(3)
+        page3[508:510] = b"\x06\x00"  # payload length 6, rowid 0
+        page3[510:516] = b"ABCDEF"
+        b.declare_freeblock(3, 512, 8)  # overwrites 512..516 with its header
+        page3[3:5] = (5).to_bytes(2, "big")
+        page3[5:7] = (508).to_bytes(2, "big")
+        b.set_cell_pointers(
+            3, [508] + [meta["leaf3"][r]["ptr"] for r in (1, 2, 3, 4)]
+        )
+        res = audit_snapshot(b.build(), 2)
+        err = res["error"]
+        self.assertEqual(res["verdict"], "rejected")
+        self.assertEqual(err["code"], "CELL_IN_FREEBLOCK")
+        self.assertEqual(err["page"], 3)
+        self.assertEqual(err["offset"], 2 * PAGE_SIZE + 8)
+        self.assertEqual(err["detail"]["cell_index"], 0)
+
+    def test_unordered_physical_layout_accepted(self):
+        # Cells physically out of pointer-array order but disjoint: legal.
+        b, _ = _base_builder()
+        info = b.add_table_leaf(
+            3,
+            [(2, b"tm-0002"), (4, b"tm-0004"), (1, b"tm-0001"), (3, b"tm-0003")],
+        )
+        b.set_cell_pointers(3, [info[r]["ptr"] for r in (1, 2, 3, 4)])
+        res = audit_snapshot(b.build(), 2)
+        self.assertEqual(res["verdict"], "accepted", res["error"])
+        pages = {p["page"]: p for p in res["pages"]}
+        self.assertEqual(pages[3]["rowid_range"], [1, 4])
+
+    def test_interior_cells_overlap_rejected(self):
+        b, _ = _base_builder()
+        info = b.add_table_interior(11, [300, 5], [3, 4, 5])
+        # Second divider cell points inside the first cell's bytes.
+        b.set_cell_pointers(
+            11, [info["ptrs"][0], info["ptrs"][0] + 1], interior=True
+        )
+        res = audit_snapshot(b.build(), 2)
+        err = res["error"]
+        self.assertEqual(err["code"], "CELL_OVERLAP")
+        self.assertEqual(err["page"], 11)
+        self.assertEqual(err["offset"], 10 * PAGE_SIZE + 12 + 2)
+
+    def test_freeblock_chain_cycle_rejected(self):
+        b, _ = _base_builder()
+        page3 = b.page(3)
+        page3[1:3] = (512).to_bytes(2, "big")
+        page3[512:514] = (520).to_bytes(2, "big")  # 512 -> 520
+        page3[514:516] = (8).to_bytes(2, "big")
+        page3[520:522] = (512).to_bytes(2, "big")  # 520 -> 512 (back-pointer)
+        page3[522:524] = (8).to_bytes(2, "big")
+        res = audit_snapshot(b.build(), 2)
+        err = res["error"]
+        self.assertEqual(err["code"], "FREEBLOCK_INVALID")
+        self.assertEqual(err["page"], 3)
+        self.assertEqual(err["offset"], 2 * PAGE_SIZE + 520)
+
+    def test_freeblock_size_too_small_rejected(self):
+        b, _ = _base_builder()
+        page3 = b.page(3)
+        page3[1:3] = (512).to_bytes(2, "big")
+        page3[512:514] = (0).to_bytes(2, "big")
+        page3[514:516] = (3).to_bytes(2, "big")  # minimum freeblock size is 4
+        res = audit_snapshot(b.build(), 2)
+        err = res["error"]
+        self.assertEqual(err["code"], "FREEBLOCK_INVALID")
+        self.assertEqual(err["page"], 3)
+        self.assertEqual(err["offset"], 2 * PAGE_SIZE + 512 + 2)
 
 
 class OverflowTests(unittest.TestCase):

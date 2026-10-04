@@ -22,6 +22,8 @@
 **结构校验**：
 
 - 单元边界与指针数组（越界指针、指针数组溢出、内容区非法均拒绝）
+- 页内单元字节区域互不重叠，且不落入页头声明的 freeblock
+  （freeblock 链本身须结构合法：偏移递增、大小 ≥ 4、不越出页面）
 - 子树行键严格递增（叶内递增；内部分隔键 ≥ 左子树最大键且 < 右子树最小键）
 - 溢出链恰好覆盖声明负载（页数精确、末页 next=0，截断/超长均拒绝）
 - 页面唯一归属：活页重复归属、B-tree 成环（祖先回指）、活页进入空闲链均拒绝
@@ -105,6 +107,8 @@ docker compose down
 | `ROOT_PAGE_OUT_OF_RANGE` | 根页越界 |
 | `NOT_A_TABLE_BTREE_PAGE` | 根/子页非表 B-tree 页 |
 | `CELL_POINTER_ARRAY_OVERFLOW` / `CONTENT_AREA_INVALID` / `CELL_POINTER_OUT_OF_BOUNDS` | 指针数组与单元边界 |
+| `CELL_OVERLAP` / `CELL_IN_FREEBLOCK` | 页内单元字节区域互相重叠 / 单元指向或跨入已声明的 freeblock |
+| `FREEBLOCK_INVALID` | freeblock 链结构非法（偏移回退、大小越界或小于 4） |
 | `TRUNCATED_CELL` | 截断单元（varint/负载越页） |
 | `ROWID_NOT_INCREASING` | 叶内行键未严格递增 |
 | `KEY_BOUND_CONFLICT` | 分隔键与子树键范围冲突 |
@@ -120,7 +124,8 @@ docker compose down
 合法快照：三级表 B-tree（根 2 → 内部页 11 → 叶 3/4，根右子叶 5），
 rowid 7 携带 2500 字节 BLOB，恰好溢出到 6、7 两页；空闲干页 8 带叶 9、10。
 违规快照逐一构造：共享溢出页、祖先回指、键界越界、活页进入空闲干链、
-截断单元、根页越界、溢出链截断/超长、空闲链计数不符及各类头部违规；
+截断单元、页内单元重叠、单元指向已声明 freeblock、根页越界、溢出链
+截断/超长、空闲链计数不符及各类头部违规；
 每个场景断言接口与页面展示同一首个违规证据（错误码、页面号、偏移一致）。
 
 ## 布局
